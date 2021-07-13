@@ -74,6 +74,9 @@ contract KashiPair is ERC20, BoringOwnable, IMasterContract {
     mapping(address => uint256) public userCollateralShare;
     // userAssetFraction is called balanceOf for ERC20 compatibility (it's in ERC20.sol)
     mapping(address => uint256) public userBorrowPart;
+    
+    mapping(address => uint256) public userBorrowTime;
+    mapping(address => uint256) public userBorrowTimeLimit;
 
     /// @notice Exchange and interest rate tracking.
     /// This is 'cached' here because calls to Oracles can be very expensive.
@@ -131,6 +134,8 @@ contract KashiPair is ERC20, BoringOwnable, IMasterContract {
     uint256 private constant PROTOCOL_FEE_DIVISOR = 1e5;
     uint256 private constant BORROW_OPENING_FEE = 50; // 0.05%
     uint256 private constant BORROW_OPENING_FEE_PRECISION = 1e5;
+
+    
 
     /// @notice The constructor is only used for the initial master contract. Subsequent clones are initialised via `init`.
     constructor(IBentoBoxV1 bentoBox_) public {
@@ -222,6 +227,10 @@ contract KashiPair is ERC20, BoringOwnable, IMasterContract {
         if (collateralShare == 0) return false;
 
         Rebase memory _totalBorrow = totalBorrow;
+        AccrueInfo memory _accrueInfo = accrueInfo;
+        
+        // add more collaterals if borrow with time limit
+        borrowPart = borrowPart.add(userBorrowTimeLimit[user].mul(_accrueInfo.interestPerSecond));
 
         return
             bentoBox.toAmount(
@@ -239,6 +248,10 @@ contract KashiPair is ERC20, BoringOwnable, IMasterContract {
     modifier solvent() {
         _;
         require(_isSolvent(msg.sender, false, exchangeRate), "KashiPair: user insolvent");
+    }
+
+    function isExceedLiquidationTimeLimit(address user) public view returns (bool) {
+        return userBorrowTime[user] == 0 ? false : block.timestamp.sub(userBorrowTime[user]) > userBorrowTimeLimit[user];
     }
 
     /// @notice Gets the exchange rate. I.e how much collateral to buy 1e18 asset.
@@ -392,6 +405,21 @@ contract KashiPair is ERC20, BoringOwnable, IMasterContract {
     function borrow(address to, uint256 amount) public solvent returns (uint256 part, uint256 share) {
         accrue();
         (part, share) = _borrow(to, amount);
+
+        if (userBorrowTime[msg.sender] == 0) {
+            userBorrowTime[msg.sender] = block.timestamp;    
+        }
+    }
+
+    function borrowWithTimeLimit(address to, uint256 amount, uint256 timeLimit) public solvent returns (uint256 part, uint256 share) {
+        accrue();
+        (part, share) = _borrow(to, amount);
+
+        userBorrowTimeLimit[msg.sender] = timeLimit;
+
+        if (userBorrowTime[msg.sender] == 0) {
+            userBorrowTime[msg.sender] = block.timestamp;    
+        }
     }
 
     /// @dev Concrete implementation of `repay`.
@@ -423,6 +451,10 @@ contract KashiPair is ERC20, BoringOwnable, IMasterContract {
     ) public returns (uint256 amount) {
         accrue();
         amount = _repay(to, skim, part);
+        
+        if (userBorrowPart[to] == 0) {
+            userBorrowTime[to] = 0;
+        }
     }
 
     // Functions that need accrue to be called
@@ -607,7 +639,9 @@ contract KashiPair is ERC20, BoringOwnable, IMasterContract {
         address to,
         ISwapper swapper,
         bool open
-    ) public {
+    ) external {
+        require(users.length == 1);
+
         // Oracle can fail but we still need to allow liquidations
         (, uint256 _exchangeRate) = updateExchangeRate();
         accrue();
@@ -619,12 +653,15 @@ contract KashiPair is ERC20, BoringOwnable, IMasterContract {
         Rebase memory bentoBoxTotals = bentoBox.totals(collateral);
         for (uint256 i = 0; i < users.length; i++) {
             address user = users[i];
-            if (!_isSolvent(user, open, _exchangeRate)) {
+            if (!_isSolvent(user, open, _exchangeRate) || this.isExceedLiquidationTimeLimit(user)){
                 uint256 borrowPart;
                 {
                     uint256 availableBorrowPart = userBorrowPart[user];
                     borrowPart = maxBorrowParts[i] > availableBorrowPart ? availableBorrowPart : maxBorrowParts[i];
                     userBorrowPart[user] = availableBorrowPart.sub(borrowPart);
+                    if (userBorrowPart[user] == 0) {
+                        userBorrowTime[user] = 0;
+                    }
                 }
                 uint256 borrowAmount = _totalBorrow.toElastic(borrowPart, false);
                 uint256 collateralShare =
@@ -654,30 +691,34 @@ contract KashiPair is ERC20, BoringOwnable, IMasterContract {
 
         if (!open) {
             // Closed liquidation using a pre-approved swapper for the benefit of the LPs
-            require(masterContract.swappers(swapper), "KashiPair: Invalid swapper");
-
-            // Swaps the users' collateral for the borrowed asset
-            bentoBox.transfer(collateral, address(this), address(swapper), allCollateralShare);
-            swapper.swap(collateral, asset, address(this), allBorrowShare, allCollateralShare);
-
-            uint256 returnedShare = bentoBox.balanceOf(asset, address(this)).sub(uint256(totalAsset.elastic));
-            uint256 extraShare = returnedShare.sub(allBorrowShare);
-            uint256 feeShare = extraShare.mul(PROTOCOL_FEE) / PROTOCOL_FEE_DIVISOR; // % of profit goes to fee
-            // solhint-disable-next-line reentrancy
-            bentoBox.transfer(asset, address(this), masterContract.feeTo(), feeShare);
-            totalAsset.elastic = totalAsset.elastic.add(returnedShare.sub(feeShare).to128());
-            emit LogAddAsset(address(swapper), address(this), extraShare.sub(feeShare), 0);
+            require(masterContract.swappers(swapper), "KashiPair: Invalid swapper");            
+            _closedLiquidate(users[0], swapper, allBorrowShare, allCollateralShare);
         } else {
             // Swap using a swapper freely chosen by the caller
-            // Open (flash) liquidation: get proceeds first and provide the borrow after
+            // Open (flash) liquidation: get proceeds first and provide the borrow after            
             bentoBox.transfer(collateral, address(this), swapper == ISwapper(0) ? to : address(swapper), allCollateralShare);
             if (swapper != ISwapper(0)) {
                 swapper.swap(collateral, asset, msg.sender, allBorrowShare, allCollateralShare);
             }
-
             bentoBox.transfer(asset, msg.sender, address(this), allBorrowShare);
             totalAsset.elastic = totalAsset.elastic.add(allBorrowShare.to128());
         }
+    }
+
+    function _closedLiquidate(address user, ISwapper swapper, uint256 allBorrowShare, uint256 allCollateralShare) internal {
+        bentoBox.transfer(collateral, address(this), address(swapper), allCollateralShare);
+        swapper.swap(collateral, asset, address(this), allBorrowShare, allCollateralShare);
+            
+        uint256 returnedShare = bentoBox.balanceOf(asset, address(this)).sub(uint256(totalAsset.elastic));
+        uint256 extraShare = returnedShare.sub(allBorrowShare);
+        uint256 feeShare = extraShare.mul(PROTOCOL_FEE) / PROTOCOL_FEE_DIVISOR; // % of profit goes to fee
+        // solhint-disable-next-line reentrancy
+        bentoBox.transfer(asset, address(this), masterContract.feeTo(), feeShare);            
+        
+        totalAsset.elastic = totalAsset.elastic.add(allBorrowShare.to128());   
+
+        bentoBox.transfer(asset, address(this), user, extraShare.sub(feeShare));
+        emit LogAddAsset(address(swapper), address(this), 0, 0);
     }
 
     /// @notice Withdraws the fees accumulated.
